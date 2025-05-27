@@ -12,6 +12,8 @@
 #include <glim/util/config.hpp>
 #include <glim/util/trajectory_manager.hpp>
 #include <glim/util/ros_cloud_converter.hpp>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl_ros/filters/voxel_grid.hpp>
 
 namespace glim {
 
@@ -328,7 +330,37 @@ void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& sub
       begin += submap->size();
     }
 
-    auto points_msg = frame_to_pointcloud2(map_frame_id, now.seconds(), *merged);
+    // Convert to PCL point cloud for voxel filtering
+    pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl_cloud->reserve(merged->num_points);
+    for (int i = 0; i < merged->num_points; ++i) {
+      const auto& pt = merged->points[i];
+      pcl_cloud->push_back(pcl::PointXYZ(pt.x(), pt.y(), pt.z()));
+    }
+
+    std::cout << "[RvizViewer] Map cloud size before voxel filter: " << pcl_cloud->size() << std::endl;
+
+    // Apply voxel filter
+    pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
+    voxel_filter.setInputCloud(pcl_cloud);
+    voxel_filter.setLeafSize(0.9f, 0.9f, 0.9f); // Set voxel size as needed
+    pcl::PointCloud<pcl::PointXYZ> filtered_cloud;
+    voxel_filter.filter(filtered_cloud);
+
+    std::cout << "[RvizViewer] Map cloud size after voxel filter: " << filtered_cloud.size() << std::endl;
+
+    // Convert filtered cloud back to gtsam_points::PointCloudCPU
+    gtsam_points::PointCloudCPU filtered_merged;
+    filtered_merged.num_points = filtered_cloud.size();
+    filtered_merged.points_storage.resize(filtered_cloud.size());
+    filtered_merged.points = filtered_merged.points_storage.data();
+    for (size_t i = 0; i < filtered_cloud.size(); ++i) {
+      filtered_merged.points[i] = Eigen::Vector4d(filtered_cloud[i].x, filtered_cloud[i].y, filtered_cloud[i].z, 1.0);
+    }
+
+    auto points_msg = frame_to_pointcloud2(map_frame_id, now.seconds(), filtered_merged);
+
+    // auto points_msg = frame_to_pointcloud2(map_frame_id, now.seconds(), *merged);
     map_pub->publish(*points_msg);
   });
 }

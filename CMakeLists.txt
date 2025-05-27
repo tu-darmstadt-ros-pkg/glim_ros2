@@ -1,8 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
-project(glim_ros VERSION 1.1.0 LANGUAGES CXX)
+project(glim_ros VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_LIST_DIR}/cmake")
+set(USE_SCOPED_HEADER_INSTALL_DIR ON)
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Choose the type of build." FORCE)
   set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
@@ -15,8 +17,12 @@ option(BUILD_WITH_CV_BRIDGE "Build with cv_bridge which enables support for proc
 find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
 
+find_package(pcl_conversions REQUIRED)
+find_package(pcl_ros REQUIRED)
+
 find_package(glim REQUIRED)
 find_package(Boost REQUIRED COMPONENTS program_options)
+
 
 if(DEFINED GLIM_USE_OPENCV AND NOT GLIM_USE_OPENCV AND BUILD_WITH_CV_BRIDGE)
   message(WARNING "BUILD_WITH_CV_BRIDGE is disabled because glim is not built with OpenCV.")
@@ -46,6 +52,7 @@ ament_auto_add_library(glim_ros SHARED
 target_include_directories(glim_ros PUBLIC
   include
 )
+
 target_link_libraries(glim_ros
   glim::glim
 )
