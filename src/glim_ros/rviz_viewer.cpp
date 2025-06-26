@@ -14,6 +14,7 @@
 #include <glim/util/ros_cloud_converter.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl_ros/filters/voxel_grid.hpp>
+#include <pcl/filters/random_sample.h>
 
 namespace glim {
 
@@ -31,6 +32,16 @@ RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
   map_frame_id = config.param<std::string>("glim_ros", "map_frame_id", "map");
   publish_imu2lidar = config.param<bool>("glim_ros", "publish_imu2lidar", true);
   tf_time_offset = config.param<double>("glim_ros", "tf_time_offset", 1e-6);
+  global_map_pub_interval = config.param<int>("glim_ros", "global_map_pub_interval", 5);
+  global_map_pub_n_points = config.param<int>("glim_ros", "global_map_pub_n_points", 10000);
+  if (global_map_pub_interval <= 0) {
+    logger->warn("Invalid global_map_pub_interval: {}. Using default value of 5 seconds.", global_map_pub_interval);
+    global_map_pub_interval = 5;
+  }
+  if (global_map_pub_n_points <= 0) {
+    logger->warn("Invalid global_map_pub_n_points: {}. Using default value of 10000 points.", global_map_pub_n_points);
+    global_map_pub_n_points = 10000;
+  }
 
   last_globalmap_pub_time = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();
   trajectory.reset(new TrajectoryManager);
@@ -303,14 +314,14 @@ void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& sub
       return;
     }
 
-    // Publish global map every 10 seconds
+    // Publish global map every x seconds
     const rclcpp::Time now = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();
-    if (now - last_globalmap_pub_time < std::chrono::seconds(10)) {
+    if ((now - last_globalmap_pub_time).seconds() < global_map_pub_interval) {
       return;
     }
     last_globalmap_pub_time = now;
 
-    logger->warn("Publishing global map is computationally demanding and not recommended");
+    // logger->warn("Publishing global map is computationally demanding and not recommended");
 
     int total_num_points = 0;
     for (const auto& submap : this->submaps) {
@@ -330,7 +341,7 @@ void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& sub
       begin += submap->size();
     }
 
-    // Convert to PCL point cloud for voxel filtering
+    // Convert to PCL point cloud for filtering
     pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZ>());
     pcl_cloud->reserve(merged->num_points);
     for (int i = 0; i < merged->num_points; ++i) {
@@ -338,16 +349,19 @@ void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& sub
       pcl_cloud->push_back(pcl::PointXYZ(pt.x(), pt.y(), pt.z()));
     }
 
-    std::cout << "[RvizViewer] Map cloud size before voxel filter: " << pcl_cloud->size() << std::endl;
+    // // Apply voxel filter
+    // pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
+    // voxel_filter.setInputCloud(pcl_cloud);
+    // voxel_filter.setLeafSize(0.9f, 0.9f, 0.9f); // Set voxel size as needed
+    // pcl::PointCloud<pcl::PointXYZ> filtered_cloud;
+    // voxel_filter.filter(filtered_cloud);
 
-    // Apply voxel filter
-    pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
-    voxel_filter.setInputCloud(pcl_cloud);
-    voxel_filter.setLeafSize(0.9f, 0.9f, 0.9f); // Set voxel size as needed
+    logger->info("Randomly sampling {} points from the map cloud for publishing", global_map_pub_n_points);
+    pcl::RandomSample<pcl::PointXYZ> random_filter;
+    random_filter.setInputCloud(pcl_cloud);
+    random_filter.setSample(global_map_pub_n_points);
     pcl::PointCloud<pcl::PointXYZ> filtered_cloud;
-    voxel_filter.filter(filtered_cloud);
-
-    std::cout << "[RvizViewer] Map cloud size after voxel filter: " << filtered_cloud.size() << std::endl;
+    random_filter.filter(filtered_cloud);
 
     // Convert filtered cloud back to gtsam_points::PointCloudCPU
     gtsam_points::PointCloudCPU filtered_merged;
