@@ -15,6 +15,7 @@
 #include <glim/util/extension_module_ros2.hpp>
 #include <glim_ros/glim_ros.hpp>
 #include <glim_ros/ros_compatibility.hpp>
+#include <glim_ros/utils.hpp>
 
 class SpeedCounter {
 public:
@@ -95,6 +96,16 @@ int main(int argc, char** argv) {
   for (const auto& bag_filename : bag_filenames) {
     spdlog::info("- {}", bag_filename);
   }
+
+  // Get, validate and log dump path
+  std::string dump_path = "/tmp/dump";
+  glim->declare_parameter<std::string>("dump_path", dump_path);
+  glim->get_parameter<std::string>("dump_path", dump_path);
+  std::string dump_path_timestamped;
+  dump_path_timestamped = glim_ros::create_timestamped_dir(dump_path);
+    
+  spdlog::info("dump_path: {}", dump_path);
+  spdlog::info("dump_path_timestamped: {}", dump_path_timestamped);
 
   // Playback range settings
   double delay = 0.0;
@@ -290,10 +301,6 @@ int main(int argc, char** argv) {
   glim->declare_parameter<bool>("auto_quit", auto_quit);
   glim->get_parameter<bool>("auto_quit", auto_quit);
 
-  std::string dump_path = "/tmp/dump";
-  glim->declare_parameter<std::string>("dump_path", dump_path);
-  glim->get_parameter<std::string>("dump_path", dump_path);
-
   for (const auto& bag_filename : bag_filenames) {
     if (!read_bag(bag_filename)) {
       auto_quit = true;
@@ -306,7 +313,7 @@ int main(int argc, char** argv) {
   }
 
   glim->wait(auto_quit);
-  glim->save(dump_path);
+  glim->save(dump_path_timestamped);
 
   return 0;
 }
