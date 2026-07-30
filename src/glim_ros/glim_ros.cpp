@@ -21,7 +21,10 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 
 #include <gtsam_points/optimizers/linearization_hook.hpp>
+#ifdef BUILD_GTSAM_POINTS_GPU
+#include <cuda_runtime.h>
 #include <gtsam_points/cuda/nonlinear_factor_set_gpu_create.hpp>
+#endif
 
 #include <glim/util/debug.hpp>
 #include <glim/util/config.hpp>
@@ -88,9 +91,20 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   intensity_field = config_sensors.param<std::string>("sensors", "intensity_field", "intensity");
   ring_field = config_sensors.param<std::string>("sensors", "ring_field", "");
 
-  // Setup GPU-based linearization
+  // Setup GPU-based linearization only when a CUDA device is present.
+  // Otherwise NonlinearFactorSetGPU construction spams cudaErrorNoDevice on
+  // every optimize, even when CPU odometry/mapping modules are selected.
 #ifdef BUILD_GTSAM_POINTS_GPU
-  gtsam_points::LinearizationHook::register_hook([]() { return gtsam_points::create_nonlinear_factor_set_gpu(); });
+  int cuda_devices = 0;
+  const cudaError_t cuda_err = cudaGetDeviceCount(&cuda_devices);
+  if (cuda_err == cudaSuccess && cuda_devices > 0) {
+    gtsam_points::LinearizationHook::register_hook([]() { return gtsam_points::create_nonlinear_factor_set_gpu(); });
+  } else {
+    spdlog::warn(
+      "No CUDA device detected ({}); GPU linearization disabled",
+      cuda_err == cudaSuccess ? "0 devices" : cudaGetErrorString(cuda_err));
+    cudaGetLastError();  // clear sticky error from the probe
+  }
 #endif
 
   // Preprocessing
