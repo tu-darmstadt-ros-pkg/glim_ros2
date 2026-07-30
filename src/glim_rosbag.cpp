@@ -1,5 +1,12 @@
 #include <glob.h>
+#include <termios.h>
+#include <unistd.h>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <spdlog/spdlog.h>
 #include <boost/format.hpp>
@@ -9,6 +16,7 @@
 #include <rosbag2_cpp/readers/sequential_reader.hpp>
 #include <rosbag2_compression/sequential_compression_reader.hpp>
 #include <rosbag2_storage/storage_filter.hpp>
+#include <rosbag2_storage/metadata_io.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
 #include <glim/util/config.hpp>
@@ -42,6 +50,94 @@ private:
   double last_sim_time;
   std::chrono::high_resolution_clock::time_point last_real_time;
 };
+
+class KeyboardHandler {
+public:
+  KeyboardHandler() : paused_(false) {
+    if (!isatty(STDIN_FILENO)) {
+      return;
+    }
+
+    struct termios original;
+    tcgetattr(STDIN_FILENO, &original);
+    struct termios raw = original;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+
+    // Remember the original terminal settings
+    saved_termios_ = original;
+    active_.store(true);
+
+    std::atexit(&KeyboardHandler::cleanup);
+    for (const int signum : {SIGINT, SIGTERM, SIGQUIT, SIGSEGV, SIGABRT}) {
+      install_handler(signum);
+    }
+  }
+
+  ~KeyboardHandler() { KeyboardHandler::cleanup(); }
+
+  static void cleanup() {
+    if (active_.exchange(false)) {
+      tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios_);
+    }
+  }
+
+  void update() {
+    if (!active_.load()) return;
+    char c;
+    while (read(STDIN_FILENO, &c, 1) > 0) {
+      if (c == ' ') {
+        paused_ = !paused_;
+        if (paused_) {
+          spdlog::info("playback paused (press space to resume)");
+        } else {
+          spdlog::info("playback resumed");
+        }
+      }
+    }
+  }
+
+  bool is_paused() const { return paused_; }
+
+private:
+  static void install_handler(int signum) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = &KeyboardHandler::signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(signum, &sa, &prev_actions_[signum]);
+  }
+
+  static void signal_handler(int signum, siginfo_t* info, void* context) {
+    KeyboardHandler::cleanup();
+
+    const struct sigaction& prev = prev_actions_[signum];
+    if (prev.sa_flags & SA_SIGINFO) {
+      if (prev.sa_sigaction) {
+        prev.sa_sigaction(signum, info, context);
+      }
+    } else if (prev.sa_handler == SIG_IGN) {
+    } else if (prev.sa_handler && prev.sa_handler != SIG_DFL) {
+      prev.sa_handler(signum);
+    } else {
+      signal(signum, SIG_DFL);
+      raise(signum);
+    }
+  }
+
+  bool paused_;
+
+  static std::atomic_bool active_;
+  static struct termios saved_termios_;
+  static struct sigaction prev_actions_[NSIG];
+};
+
+std::atomic_bool KeyboardHandler::active_{false};
+struct termios KeyboardHandler::saved_termios_;
+struct sigaction KeyboardHandler::prev_actions_[NSIG];
 
 int main(int argc, char** argv) {
   if (argc < 2) {
@@ -126,7 +222,7 @@ int main(int argc, char** argv) {
 
   // Playback speed settings
   const double playback_speed = config_ros.param<double>("glim_ros", "playback_speed", 100.0);
-  std::chrono::high_resolution_clock::time_point real_t0;
+  std::chrono::system_clock::time_point real_t0;
   rcutils_time_point_value_t bag_t0 = 0;
   SpeedCounter speed_counter;
 
@@ -139,11 +235,37 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(delay * 1000)));
   }
 
+  // Keyboard handler for pause/resume
+  KeyboardHandler keyboard;
+
   // Bag read function
   const auto read_bag = [&](const std::string& bag_filename) {
     spdlog::info("opening {}", bag_filename);
     rosbag2_storage::StorageOptions options;
     options.uri = bag_filename;
+
+    bool is_mcap = bag_filename.size() > 5 && bag_filename.rfind(".mcap") == (bag_filename.size() - 5);
+    if (is_mcap) {
+      options.storage_id = "mcap";
+    } else if (std::filesystem::is_directory(bag_filename)) {
+      try {
+        rosbag2_storage::MetadataIo metadata_io;
+        const auto metadata = metadata_io.read_metadata(bag_filename);
+        options.storage_id = metadata.storage_identifier;
+
+        if (options.storage_id.empty()) {
+          spdlog::warn("storage_identifier not found in metadata.yaml (uri={}), fallback to sqlite3", bag_filename);
+          options.storage_id = "sqlite3";
+        } else {
+          spdlog::info("detected storage_id={} from metadata.yaml", options.storage_id);
+        }
+      } catch (const std::exception& e) {
+        spdlog::warn("failed to read metadata.yaml (uri={}): {} (fallback to sqlite3)", bag_filename, e.what());
+        options.storage_id = "sqlite3";
+      }
+    } else {
+      options.storage_id = "sqlite3";
+    }
 
     rosbag2_cpp::ConverterOptions converter_options;
 
@@ -186,7 +308,7 @@ int main(int argc, char** argv) {
       const rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
 
       if (real_t0.time_since_epoch().count() == 0) {
-        real_t0 = std::chrono::high_resolution_clock::now();
+        real_t0 = std::chrono::system_clock::now();
       }
 
       const auto msg_time = get_msg_recv_timestamp(*msg);
@@ -201,7 +323,7 @@ int main(int argc, char** argv) {
 
         start_offset = 0.0;
         bag_t0 = 0;
-        real_t0 = std::chrono::high_resolution_clock::from_time_t(0);
+        real_t0 = std::chrono::system_clock::from_time_t(0);
         continue;
       }
 
@@ -215,9 +337,25 @@ int main(int argc, char** argv) {
         return false;
       }
 
+      // Pause/resume handling
+      keyboard.update();
+      if (keyboard.is_paused()) {
+        auto pause_start = std::chrono::system_clock::now();
+        while (keyboard.is_paused() && rclcpp::ok()) {
+          rclcpp::spin_some(glim);
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          keyboard.update();
+        }
+        if (!rclcpp::ok()) {
+          return false;
+        }
+        // Adjust real_t0 to account for pause duration to avoid fast-forward
+        real_t0 += std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::system_clock::now() - pause_start);
+      }
+
       const auto bag_elapsed = std::chrono::nanoseconds(msg_time - bag_t0);
-      while (playback_speed > 0.0 && (std::chrono::high_resolution_clock::now() - real_t0) * playback_speed < bag_elapsed) {
-        const double real_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - real_t0).count() / 1e9;
+      while (playback_speed > 0.0 && (std::chrono::system_clock::now() - real_t0) * playback_speed < bag_elapsed) {
+        const double real_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now() - real_t0).count() / 1e9;
         spdlog::debug("throttling (real_elapsed={} bag_elapsed={} playback_speed={})", real_elapsed, bag_elapsed.count() / 1e9, playback_speed);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
@@ -282,7 +420,7 @@ int main(int argc, char** argv) {
       speed_counter.update(msg_time / 1e9);
 
       const auto t0 = std::chrono::high_resolution_clock::now();
-      while (glim->needs_wait()) {
+      while (glim->needs_wait() && rclcpp::ok()) {
         rclcpp::spin_some(glim);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         spdlog::debug("throttling (waiting for odometry estimation)");
@@ -308,12 +446,14 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (!auto_quit) {
+  if (!auto_quit && rclcpp::ok()) {
     rclcpp::spin(glim);
   }
 
+  keyboard.cleanup();  // Explicitly restore terminal settings to avoid issues if the program is interrupted before exiting normally.
   glim->wait(auto_quit);
   glim->save(dump_path_timestamped);
+  glim.reset();
 
   return 0;
 }

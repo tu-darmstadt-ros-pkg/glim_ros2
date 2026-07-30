@@ -1,5 +1,5 @@
-cmake_minimum_required(VERSION 3.16)
-project(glim_ros VERSION 1.1.0 LANGUAGES C CXX)
+cmake_minimum_required(VERSION 3.22)
+project(glim_ros VERSION 1.2.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_LIST_DIR}/cmake")
@@ -8,6 +8,11 @@ set(USE_SCOPED_HEADER_INSTALL_DIR ON)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Choose the type of build." FORCE)
   set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+endif()
+
+if(POLICY CMP0167)
+  # Prefer BoostConfig.cmake over the removed FindBoost module (CMake >= 3.30).
+  cmake_policy(SET CMP0167 NEW)
 endif()
 
 option(BUILD_WITH_CUDA "Build with GPU support" ON)
