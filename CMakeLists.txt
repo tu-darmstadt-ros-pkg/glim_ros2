@@ -22,6 +22,13 @@ option(BUILD_WITH_CV_BRIDGE "Build with cv_bridge which enables support for proc
 find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
 
+# VTK (pulled in via PCL/pcl_ros) may require MPI::MPI_C even when we never use MPI.
+# Provide a stub target so configure succeeds on images without OpenMPI installed.
+find_package(MPI QUIET COMPONENTS C)
+if(NOT TARGET MPI::MPI_C)
+  add_library(MPI::MPI_C INTERFACE IMPORTED)
+endif()
+
 find_package(pcl_conversions REQUIRED)
 find_package(pcl_ros REQUIRED)
 
