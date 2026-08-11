@@ -39,13 +39,24 @@
 #include <glim/mapping/async_global_mapping.hpp>
 #include <glim_ros/ros_compatibility.hpp>
 #include <glim_ros/ros_qos.hpp>
+#include <glim_ros/utils.hpp>
 
 namespace glim {
 
 GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options) {
-  // Setup logger
-  auto logger = spdlog::stdout_color_mt("glim");
-  logger->sinks().push_back(get_ringbuffer_sink());
+  // Setup logger (get-or-create: composable reload / mt container can hit "already exists")
+  std::shared_ptr<spdlog::logger> logger = spdlog::get("glim");
+  if (!logger) {
+    try {
+      logger = spdlog::stdout_color_mt("glim");
+      logger->sinks().push_back(get_ringbuffer_sink());
+    } catch (const spdlog::spdlog_ex&) {
+      logger = spdlog::get("glim");
+    }
+  }
+  if (!logger) {
+    throw std::runtime_error("Failed to create or get spdlog logger 'glim'");
+  }
   spdlog::set_default_logger(logger);
 
   bool debug = false;
@@ -65,8 +76,12 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   this->declare_parameter<bool>("dump_on_unload", false);
   this->get_parameter<bool>("dump_on_unload", dump_on_unload);
 
+  dump_path = "/tmp/dump";
+  this->declare_parameter<std::string>("dump_path", dump_path);
+  this->get_parameter<std::string>("dump_path", dump_path);
+
   if (dump_on_unload) {
-    spdlog::info("dump_on_unload={}", dump_on_unload);
+    spdlog::info("dump_on_unload={} dump_path={}", dump_on_unload, dump_path);
   }
 
   std::string config_path;
@@ -219,13 +234,15 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
 
 GlimROS::~GlimROS() {
   spdlog::debug("quit");
-  extension_modules.clear();
 
   if (dump_on_unload) {
-    std::string dump_path = "/tmp/dump";
+    const std::string dump_path_timestamped = glim_ros::create_timestamped_dir(dump_path);
+    spdlog::info("dump_on_unload: saving to {}", dump_path_timestamped);
     wait(true);
-    save(dump_path);
+    save(dump_path_timestamped);
   }
+
+  extension_modules.clear();
 }
 
 const std::vector<std::shared_ptr<GenericTopicSubscription>>& GlimROS::extension_subscriptions() {
