@@ -44,9 +44,19 @@
 namespace glim {
 
 GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options) {
-  // Setup logger
-  auto logger = spdlog::stdout_color_mt("glim");
-  logger->sinks().push_back(get_ringbuffer_sink());
+  // Setup logger (get-or-create: composable reload / mt container can hit "already exists")
+  std::shared_ptr<spdlog::logger> logger = spdlog::get("glim");
+  if (!logger) {
+    try {
+      logger = spdlog::stdout_color_mt("glim");
+      logger->sinks().push_back(get_ringbuffer_sink());
+    } catch (const spdlog::spdlog_ex&) {
+      logger = spdlog::get("glim");
+    }
+  }
+  if (!logger) {
+    throw std::runtime_error("Failed to create or get spdlog logger 'glim'");
+  }
   spdlog::set_default_logger(logger);
 
   bool debug = false;
