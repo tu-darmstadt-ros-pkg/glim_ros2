@@ -193,13 +193,11 @@ int main(int argc, char** argv) {
     spdlog::info("- {}", bag_filename);
   }
 
-  // Get, validate and log dump path
+  // dump_path is declared by GlimROS; create a timestamped dump dir for save-on-exit
   std::string dump_path = "/tmp/dump";
-  glim->declare_parameter<std::string>("dump_path", dump_path);
   glim->get_parameter<std::string>("dump_path", dump_path);
-  std::string dump_path_timestamped;
-  dump_path_timestamped = glim_ros::create_timestamped_dir(dump_path);
-    
+  const std::string dump_path_timestamped = glim_ros::create_timestamped_dir(dump_path);
+
   spdlog::info("dump_path: {}", dump_path);
   spdlog::info("dump_path_timestamped: {}", dump_path_timestamped);
 
