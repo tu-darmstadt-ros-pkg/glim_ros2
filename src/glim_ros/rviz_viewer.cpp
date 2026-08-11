@@ -1,6 +1,7 @@
 #include <glim_ros/rviz_viewer.hpp>
 
 #include <mutex>
+#include <algorithm>
 #include <spdlog/spdlog.h>
 #include <rclcpp/clock.hpp>
 
@@ -44,7 +45,8 @@ RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
     global_map_pub_n_points = 10000;
   }
 
-  last_globalmap_pub_time = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();
+  // Epoch so the first map (including a provisional unfinished submap) publishes immediately
+  last_globalmap_pub_time = rclcpp::Time(0, 0, RCL_ROS_TIME);
   trajectory.reset(new TrajectoryManager);
 
   set_callbacks();
@@ -129,8 +131,11 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
 
 void RvizViewer::set_callbacks() {
   using std::placeholders::_1;
+  using std::placeholders::_2;
   OdometryEstimationCallbacks::on_new_frame.add([this](const EstimationFrame::ConstPtr& new_frame) { odometry_new_frame(new_frame, false); });
   OdometryEstimationCallbacks::on_update_new_frame.add([this](const EstimationFrame::ConstPtr& new_frame) { odometry_new_frame(new_frame, true); });
+  SubMappingCallbacks::on_new_keyframe.add(std::bind(&RvizViewer::submap_on_new_keyframe, this, _1, _2));
+  SubMappingCallbacks::on_new_submap.add(std::bind(&RvizViewer::submap_on_new_submap, this, _1));
   GlobalMappingCallbacks::on_update_submaps.add(std::bind(&RvizViewer::globalmap_on_update_submaps, this, _1));
 }
 
@@ -623,6 +628,34 @@ void RvizViewer::odometry_new_frame(const EstimationFrame::ConstPtr& new_frame, 
   }
 }
 
+void RvizViewer::submap_on_new_keyframe(int id, const EstimationFrame::ConstPtr& keyframe) {
+  if (!keyframe || !keyframe->frame) {
+    return;
+  }
+
+  const Eigen::Isometry3d T_world_sensor = keyframe->T_world_sensor();
+  const auto frame = keyframe->frame;
+
+  invoke([this, id, T_world_sensor, frame] {
+    if (id == 0) {
+      pending_keyframe_frames.clear();
+      pending_keyframe_poses.clear();
+    }
+
+    pending_keyframe_frames.push_back(frame);
+    pending_keyframe_poses.push_back(T_world_sensor);
+    publish_global_map_if_due();
+  });
+}
+
+void RvizViewer::submap_on_new_submap(const SubMap::ConstPtr& /*submap*/) {
+  // Keyframes of the completed submap are now represented by the SubMap itself.
+  invoke([this] {
+    pending_keyframe_frames.clear();
+    pending_keyframe_poses.clear();
+  });
+}
+
 void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& submaps) {
   const SubMap::ConstPtr latest_submap = submaps.back();
 
@@ -633,82 +666,94 @@ void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& sub
     trajectory->update_anchor(stamp_endpoint_R, T_world_endpoint_R);
   }
 
-  std::vector<Eigen::Isometry3d, Eigen::aligned_allocator<Eigen::Isometry3d>> submap_poses(submaps.size());
-  for (int i = 0; i < submaps.size(); i++) {
-    submap_poses[i] = submaps[i]->T_world_origin;
+  std::vector<gtsam_points::PointCloud::ConstPtr> frames(submaps.size());
+  std::vector<Eigen::Isometry3d, Eigen::aligned_allocator<Eigen::Isometry3d>> poses(submaps.size());
+  for (size_t i = 0; i < submaps.size(); i++) {
+    frames[i] = submaps[i]->frame;
+    poses[i] = submaps[i]->T_world_origin;
   }
 
-  // Invoke a submap concatenation task in the RvizViewer thread
-  invoke([this, latest_submap, submap_poses] {
-    this->submaps.push_back(latest_submap->frame);
+  invoke([this, frames = std::move(frames), poses = std::move(poses)] {
+    this->submaps = frames;
+    this->submap_poses = poses;
+    publish_global_map_if_due();
+  });
+}
 
-    if (!map_pub->get_subscription_count()) {
-      return;
-    }
+void RvizViewer::publish_global_map_if_due() {
+  if (!map_pub || !map_pub->get_subscription_count()) {
+    return;
+  }
 
-    // Publish global map every x seconds
-    const rclcpp::Time now = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();
-    if ((now - last_globalmap_pub_time).seconds() < global_map_pub_interval) {
-      return;
-    }
-    last_globalmap_pub_time = now;
+  const rclcpp::Time now = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();
+  if ((now - last_globalmap_pub_time).seconds() < global_map_pub_interval) {
+    return;
+  }
+  last_globalmap_pub_time = now;
 
-    // logger->warn("Publishing global map is computationally demanding and not recommended");
-
-    int total_num_points = 0;
-    for (const auto& submap : this->submaps) {
+  int total_num_points = 0;
+  for (const auto& submap : this->submaps) {
+    if (submap) {
       total_num_points += submap->size();
     }
-
-    // Concatenate all the submap points
-    gtsam_points::PointCloudCPU::Ptr merged(new gtsam_points::PointCloudCPU);
-    merged->num_points = total_num_points;
-    merged->points_storage.resize(total_num_points);
-    merged->points = merged->points_storage.data();
-
-    int begin = 0;
-    for (int i = 0; i < this->submaps.size(); i++) {
-      const auto& submap = this->submaps[i];
-      std::transform(submap->points, submap->points + submap->size(), merged->points + begin, [&](const Eigen::Vector4d& p) { return submap_poses[i] * p; });
-      begin += submap->size();
+  }
+  for (const auto& frame : pending_keyframe_frames) {
+    if (frame) {
+      total_num_points += frame->size();
     }
+  }
+  if (total_num_points == 0) {
+    return;
+  }
 
-    // Convert to PCL point cloud for filtering
-    pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZ>());
-    pcl_cloud->reserve(merged->num_points);
-    for (int i = 0; i < merged->num_points; ++i) {
-      const auto& pt = merged->points[i];
-      pcl_cloud->push_back(pcl::PointXYZ(pt.x(), pt.y(), pt.z()));
+  gtsam_points::PointCloudCPU::Ptr merged(new gtsam_points::PointCloudCPU);
+  merged->num_points = total_num_points;
+  merged->points_storage.resize(total_num_points);
+  merged->points = merged->points_storage.data();
+
+  int begin = 0;
+  for (size_t i = 0; i < this->submaps.size(); i++) {
+    const auto& submap = this->submaps[i];
+    if (!submap) {
+      continue;
     }
-
-    // // Apply voxel filter
-    // pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
-    // voxel_filter.setInputCloud(pcl_cloud);
-    // voxel_filter.setLeafSize(0.9f, 0.9f, 0.9f); // Set voxel size as needed
-    // pcl::PointCloud<pcl::PointXYZ> filtered_cloud;
-    // voxel_filter.filter(filtered_cloud);
-
-    logger->info("Randomly sampling {} points from the map cloud for publishing", global_map_pub_n_points);
-    pcl::RandomSample<pcl::PointXYZ> random_filter;
-    random_filter.setInputCloud(pcl_cloud);
-    random_filter.setSample(global_map_pub_n_points);
-    pcl::PointCloud<pcl::PointXYZ> filtered_cloud;
-    random_filter.filter(filtered_cloud);
-
-    // Convert filtered cloud back to gtsam_points::PointCloudCPU
-    gtsam_points::PointCloudCPU filtered_merged;
-    filtered_merged.num_points = filtered_cloud.size();
-    filtered_merged.points_storage.resize(filtered_cloud.size());
-    filtered_merged.points = filtered_merged.points_storage.data();
-    for (size_t i = 0; i < filtered_cloud.size(); ++i) {
-      filtered_merged.points[i] = Eigen::Vector4d(filtered_cloud[i].x, filtered_cloud[i].y, filtered_cloud[i].z, 1.0);
+    std::transform(submap->points, submap->points + submap->size(), merged->points + begin, [&](const Eigen::Vector4d& p) { return this->submap_poses[i] * p; });
+    begin += submap->size();
+  }
+  for (size_t i = 0; i < pending_keyframe_frames.size(); i++) {
+    const auto& frame = pending_keyframe_frames[i];
+    if (!frame) {
+      continue;
     }
+    std::transform(frame->points, frame->points + frame->size(), merged->points + begin, [&](const Eigen::Vector4d& p) { return pending_keyframe_poses[i] * p; });
+    begin += frame->size();
+  }
 
-    auto points_msg = frame_to_pointcloud2(map_frame_id, now.seconds(), filtered_merged);
+  pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+  pcl_cloud->reserve(merged->num_points);
+  for (int i = 0; i < merged->num_points; ++i) {
+    const auto& pt = merged->points[i];
+    pcl_cloud->push_back(pcl::PointXYZ(pt.x(), pt.y(), pt.z()));
+  }
 
-    // auto points_msg = frame_to_pointcloud2(map_frame_id, now.seconds(), *merged);
-    map_pub->publish(*points_msg);
-  });
+  const int sample_n = std::min(global_map_pub_n_points, static_cast<int>(pcl_cloud->size()));
+  logger->info("Publishing map cloud ({} points, sampling {})", pcl_cloud->size(), sample_n);
+  pcl::RandomSample<pcl::PointXYZ> random_filter;
+  random_filter.setInputCloud(pcl_cloud);
+  random_filter.setSample(sample_n);
+  pcl::PointCloud<pcl::PointXYZ> filtered_cloud;
+  random_filter.filter(filtered_cloud);
+
+  gtsam_points::PointCloudCPU filtered_merged;
+  filtered_merged.num_points = filtered_cloud.size();
+  filtered_merged.points_storage.resize(filtered_cloud.size());
+  filtered_merged.points = filtered_merged.points_storage.data();
+  for (size_t i = 0; i < filtered_cloud.size(); ++i) {
+    filtered_merged.points[i] = Eigen::Vector4d(filtered_cloud[i].x, filtered_cloud[i].y, filtered_cloud[i].z, 1.0);
+  }
+
+  auto points_msg = frame_to_pointcloud2(map_frame_id, now.seconds(), filtered_merged);
+  map_pub->publish(*points_msg);
 }
 
 void RvizViewer::invoke(const std::function<void()>& task) {
