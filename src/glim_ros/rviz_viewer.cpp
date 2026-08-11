@@ -72,9 +72,10 @@ RvizViewer::~RvizViewer() {
 std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclcpp::Node& node) {
   tf_buffer = std::make_unique<tf2_ros::Buffer>(node.get_clock());
   // Bind the listener to the GlimROS node so /tf and /tf_static remaps apply.
-  // Creating a TransformListener without a node makes an internal node that
-  // always subscribes to absolute /tf[/static], which breaks namespaced robots.
-  tf_listener = std::make_unique<tf2_ros::TransformListener>(*tf_buffer, node.shared_from_this());
+  // Use a raw Node* (not shared_from_this): create_subscriptions runs during
+  // GlimROS construction, and component loaders don't use make_shared, so
+  // shared_from_this() throws std::bad_weak_ptr.
+  tf_listener = std::make_unique<tf2_ros::TransformListener>(*tf_buffer, &node);
   tf_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(node);
 
   rmw_qos_profile_t map_qos_profile = {
