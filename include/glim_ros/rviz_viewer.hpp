@@ -5,6 +5,8 @@
 #include <thread>
 #include <chrono>
 
+#include <Eigen/Geometry>
+
 #include <rclcpp/rclcpp.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -42,6 +44,7 @@ public:
 
 private:
   void set_callbacks();
+  bool update_T_imu_base();
   void odometry_new_frame(const EstimationFrame::ConstPtr& new_frame, bool corrected);
   void submap_on_new_keyframe(int id, const EstimationFrame::ConstPtr& keyframe);
   void submap_on_new_submap(const SubMap::ConstPtr& submap);
@@ -67,6 +70,12 @@ private:
   std::string odom_frame_id;
   std::string map_frame_id;
   bool publish_imu2lidar;
+  // If true, publish odom/map at the first base_frame pose (Athena/FAST-LIO style)
+  // instead of the first IMU pose. Requires a TF from imu_frame_id to base_frame_id.
+  bool base_centric_frames;
+  std::atomic_bool T_imu_base_valid{false};
+  Eigen::Isometry3d T_imu_base = Eigen::Isometry3d::Identity();
+  Eigen::Isometry3d T_base_imu = Eigen::Isometry3d::Identity();
   double tf_time_offset;
   int global_map_pub_interval;
   int global_map_pub_n_points;
