@@ -44,6 +44,10 @@ public:
 
 private:
   void set_callbacks();
+  //! Drops the trajectory and map cached for a pipeline that was reset (see GlimROSCallbacks::on_reset)
+  void reset_state();
+  //! Replaces the latched ~/map with an empty cloud so RViz drops the previous map immediately
+  void publish_empty_map();
   bool update_T_imu_base();
   void odometry_new_frame(const EstimationFrame::ConstPtr& new_frame, bool corrected);
   void submap_on_new_keyframe(int id, const EstimationFrame::ConstPtr& keyframe);

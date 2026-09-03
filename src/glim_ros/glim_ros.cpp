@@ -37,6 +37,7 @@
 #include <glim/odometry/async_odometry_estimation.hpp>
 #include <glim/mapping/async_sub_mapping.hpp>
 #include <glim/mapping/async_global_mapping.hpp>
+#include <glim_ros/glim_ros_callbacks.hpp>
 #include <glim_ros/ros_compatibility.hpp>
 #include <glim_ros/ros_qos.hpp>
 #include <glim_ros/utils.hpp>
@@ -122,46 +123,10 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   }
 #endif
 
-  // Preprocessing
-  time_keeper.reset(new glim::TimeKeeper);
-  preprocessor.reset(new glim::CloudPreprocessor);
-
-  // Odometry estimation
-  glim::Config config_odometry(glim::GlobalConfig::get_config_path("config_odometry"));
-  const std::string odometry_estimation_so_name = config_odometry.param<std::string>("odometry_estimation", "so_name", "libodometry_estimation_cpu.so");
-  spdlog::info("load {}", odometry_estimation_so_name);
-
-  std::shared_ptr<glim::OdometryEstimationBase> odom = OdometryEstimationBase::load_module(odometry_estimation_so_name);
-  if (!odom) {
-    spdlog::critical("failed to load odometry estimation module");
+  // Preprocessing, odometry estimation, local and global mapping
+  if (!create_pipeline()) {
+    spdlog::critical("failed to create the mapping pipeline");
     abort();
-  }
-  odometry_estimation.reset(new glim::AsyncOdometryEstimation(odom, odom->requires_imu()));
-
-  // Sub mapping
-  if (config_ros.param<bool>("glim_ros", "enable_local_mapping", true)) {
-    const std::string sub_mapping_so_name =
-      glim::Config(glim::GlobalConfig::get_config_path("config_sub_mapping")).param<std::string>("sub_mapping", "so_name", "libsub_mapping.so");
-    if (!sub_mapping_so_name.empty()) {
-      spdlog::info("load {}", sub_mapping_so_name);
-      auto sub = SubMappingBase::load_module(sub_mapping_so_name);
-      if (sub) {
-        sub_mapping.reset(new AsyncSubMapping(sub));
-      }
-    }
-  }
-
-  // Global mapping
-  if (config_ros.param<bool>("glim_ros", "enable_global_mapping", true)) {
-    const std::string global_mapping_so_name =
-      glim::Config(glim::GlobalConfig::get_config_path("config_global_mapping")).param<std::string>("global_mapping", "so_name", "libglobal_mapping.so");
-    if (!global_mapping_so_name.empty()) {
-      spdlog::info("load {}", global_mapping_so_name);
-      auto global = GlobalMappingBase::load_module(global_mapping_so_name);
-      if (global) {
-        global_mapping.reset(new AsyncGlobalMapping(global));
-      }
-    }
   }
 
   // Extention modules
@@ -226,6 +191,9 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
     sub->create_subscriber(*this);
   }
 
+  // Services
+  reset_service = this->create_service<std_srvs::srv::Trigger>("~/reset", std::bind(&GlimROS::reset_callback, this, _1, std::placeholders::_2));
+
   // Start timer
   timer = this->create_wall_timer(std::chrono::milliseconds(1), [this]() { timer_callback(); });
 
@@ -245,12 +213,102 @@ GlimROS::~GlimROS() {
   extension_modules.clear();
 }
 
+bool GlimROS::create_pipeline() {
+  glim::Config config_ros(glim::GlobalConfig::get_config_path("config_ros"));
+
+  // Preprocessing
+  time_keeper.reset(new glim::TimeKeeper);
+  preprocessor.reset(new glim::CloudPreprocessor);
+
+  // Odometry estimation
+  glim::Config config_odometry(glim::GlobalConfig::get_config_path("config_odometry"));
+  const std::string odometry_estimation_so_name = config_odometry.param<std::string>("odometry_estimation", "so_name", "libodometry_estimation_cpu.so");
+  spdlog::info("load {}", odometry_estimation_so_name);
+
+  std::shared_ptr<glim::OdometryEstimationBase> odom = OdometryEstimationBase::load_module(odometry_estimation_so_name);
+  if (!odom) {
+    spdlog::critical("failed to load odometry estimation module");
+    return false;
+  }
+  odometry_estimation.reset(new glim::AsyncOdometryEstimation(odom, odom->requires_imu()));
+
+  // Sub mapping
+  if (config_ros.param<bool>("glim_ros", "enable_local_mapping", true)) {
+    const std::string sub_mapping_so_name =
+      glim::Config(glim::GlobalConfig::get_config_path("config_sub_mapping")).param<std::string>("sub_mapping", "so_name", "libsub_mapping.so");
+    if (!sub_mapping_so_name.empty()) {
+      spdlog::info("load {}", sub_mapping_so_name);
+      auto sub = SubMappingBase::load_module(sub_mapping_so_name);
+      if (sub) {
+        sub_mapping.reset(new AsyncSubMapping(sub));
+      }
+    }
+  }
+
+  // Global mapping
+  if (config_ros.param<bool>("glim_ros", "enable_global_mapping", true)) {
+    const std::string global_mapping_so_name =
+      glim::Config(glim::GlobalConfig::get_config_path("config_global_mapping")).param<std::string>("global_mapping", "so_name", "libglobal_mapping.so");
+    if (!global_mapping_so_name.empty()) {
+      spdlog::info("load {}", global_mapping_so_name);
+      auto global = GlobalMappingBase::load_module(global_mapping_so_name);
+      if (global) {
+        global_mapping.reset(new AsyncGlobalMapping(global));
+      }
+    }
+  }
+
+  return true;
+}
+
+void GlimROS::destroy_pipeline() {
+  // Reverse creation order. Each destructor stops the module's worker thread, so no callback of a
+  // destroyed module can run afterwards.
+  global_mapping.reset();
+  sub_mapping.reset();
+  odometry_estimation.reset();
+  preprocessor.reset();
+  time_keeper.reset();
+}
+
+bool GlimROS::reset_pipeline() {
+  std::lock_guard<std::mutex> lock(pipeline_mutex);
+
+  spdlog::warn("reset requested: discarding the current map and restarting odometry at the current pose");
+  destroy_pipeline();
+
+  // Extension modules stay loaded: their callbacks are registered in global slots that cannot be
+  // unregistered, so recreating them would leave dangling callbacks behind. They are told to drop
+  // the state cached for the destroyed pipeline instead.
+  GlimROSCallbacks::on_reset();
+
+  if (!create_pipeline()) {
+    spdlog::critical("failed to rebuild the mapping pipeline. GLIM is inactive and drops all input");
+    return false;
+  }
+
+  spdlog::info("reset done");
+  return true;
+}
+
+void GlimROS::reset_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res) {
+  res->success = reset_pipeline();
+  res->message = res->success ? "map cleared, odometry restarted at the current pose" : "failed to reload the mapping modules, GLIM is inactive";
+}
+
 const std::vector<std::shared_ptr<GenericTopicSubscription>>& GlimROS::extension_subscriptions() {
   return extension_subs;
 }
 
 void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
   spdlog::trace("IMU: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
+
+  std::lock_guard<std::mutex> lock(pipeline_mutex);
+  if (!time_keeper || !odometry_estimation) {
+    // Pipeline is being rebuilt or could not be reloaded
+    return;
+  }
+
   if (!GlobalConfig::instance()->has_param("meta", "imu_frame_id")) {
     spdlog::debug("auto-detecting IMU frame ID: {}", msg->header.frame_id);
     GlobalConfig::instance()->override_param<std::string>("meta", "imu_frame_id", msg->header.frame_id);
@@ -291,6 +349,13 @@ void GlimROS::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
 #ifdef BUILD_WITH_CV_BRIDGE
 void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) {
   spdlog::trace("image: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
+
+  std::lock_guard<std::mutex> lock(pipeline_mutex);
+  if (!odometry_estimation) {
+    // Pipeline is being rebuilt or could not be reloaded
+    return;
+  }
+
   if (!GlobalConfig::instance()->has_param("meta", "image_frame")) {
     spdlog::debug("auto-detecting image frame ID: {}", msg->header.frame_id);
     GlobalConfig::instance()->override_param<std::string>("meta", "image_frame", msg->header.frame_id);
@@ -311,6 +376,13 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
 
 size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
   spdlog::trace("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
+
+  std::lock_guard<std::mutex> lock(pipeline_mutex);
+  if (!time_keeper || !preprocessor || !odometry_estimation) {
+    // Pipeline is being rebuilt or could not be reloaded
+    return 0;
+  }
+
   if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {
     spdlog::debug("auto-detecting LiDAR frame ID: {}", msg->header.frame_id);
     GlobalConfig::instance()->override_param<std::string>("meta", "lidar_frame_id", msg->header.frame_id);
@@ -360,6 +432,12 @@ void GlimROS::timer_callback() {
     }
   }
 
+  std::lock_guard<std::mutex> lock(pipeline_mutex);
+  if (!odometry_estimation) {
+    // Pipeline is being rebuilt or could not be reloaded
+    return;
+  }
+
   std::vector<glim::EstimationFrame::ConstPtr> estimation_frames;
   std::vector<glim::EstimationFrame::ConstPtr> marginalized_frames;
   odometry_estimation->get_results(estimation_frames, marginalized_frames);
@@ -379,6 +457,12 @@ void GlimROS::timer_callback() {
 }
 
 void GlimROS::wait(bool auto_quit) {
+  std::lock_guard<std::mutex> lock(pipeline_mutex);
+  if (!odometry_estimation) {
+    // The pipeline could not be reloaded by a reset, so there is nothing to flush
+    return;
+  }
+
   spdlog::info("waiting for odometry estimation");
   odometry_estimation->join();
 
@@ -414,6 +498,7 @@ void GlimROS::wait(bool auto_quit) {
 }
 
 void GlimROS::save(const std::string& path) {
+  std::lock_guard<std::mutex> lock(pipeline_mutex);
   if (global_mapping) {
     global_mapping->save(path);
   }

@@ -16,6 +16,7 @@
 #include <glim/util/config.hpp>
 #include <glim/util/trajectory_manager.hpp>
 #include <glim/util/ros_cloud_converter.hpp>
+#include <glim_ros/glim_ros_callbacks.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl_ros/filters/voxel_grid.hpp>
 #include <pcl/filters/random_sample.h>
@@ -158,6 +159,64 @@ void RvizViewer::set_callbacks() {
   SubMappingCallbacks::on_new_keyframe.add(std::bind(&RvizViewer::submap_on_new_keyframe, this, _1, _2));
   SubMappingCallbacks::on_new_submap.add(std::bind(&RvizViewer::submap_on_new_submap, this, _1));
   GlobalMappingCallbacks::on_update_submaps.add(std::bind(&RvizViewer::globalmap_on_update_submaps, this, _1));
+  GlimROSCallbacks::on_reset.add(std::bind(&RvizViewer::reset_state, this));
+}
+
+void RvizViewer::reset_state() {
+  logger->warn("pipeline was reset: dropping the cached trajectory and map");
+
+  {
+    // The new pipeline starts at the origin again, so the odom -> map anchor of the old trajectory
+    // would place every pose incorrectly.
+    std::lock_guard<std::mutex> lock(trajectory_mutex);
+    trajectory.reset(new TrajectoryManager);
+  }
+
+  // Drop queued tasks from the destroyed pipeline so no stale map/keyframe data is replayed.
+  {
+    std::lock_guard<std::mutex> lock(invoke_queue_mutex);
+    invoke_queue.clear();
+    invoke_queue.push_back([this] {
+      submaps.clear();
+      submap_poses.clear();
+      pending_keyframe_frames.clear();
+      pending_keyframe_poses.clear();
+      // Publish the new map as soon as its first keyframe arrives
+      last_globalmap_pub_time = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      publish_empty_map();
+    });
+  }
+}
+
+void RvizViewer::publish_empty_map() {
+  if (!map_pub) {
+    return;
+  }
+
+  sensor_msgs::msg::PointCloud2 msg;
+  msg.header.frame_id = map_frame_id;
+  msg.header.stamp = rclcpp::Clock(RCL_ROS_TIME).now();
+  msg.height = 1;
+  msg.width = 0;
+  msg.is_dense = true;
+  msg.is_bigendian = false;
+  msg.point_step = 12;
+  msg.row_step = 0;
+
+  auto add_field = [](sensor_msgs::msg::PointCloud2& cloud, const std::string& name, uint32_t offset) {
+    sensor_msgs::msg::PointField field;
+    field.name = name;
+    field.offset = offset;
+    field.datatype = sensor_msgs::msg::PointField::FLOAT32;
+    field.count = 1;
+    cloud.fields.push_back(field);
+  };
+  add_field(msg, "x", 0);
+  add_field(msg, "y", 4);
+  add_field(msg, "z", 8);
+
+  map_pub->publish(msg);
+  logger->info("published empty map after reset");
 }
 
 bool RvizViewer::update_T_imu_base() {

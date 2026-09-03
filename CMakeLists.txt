@@ -59,6 +59,7 @@ endif()
 ### glim_ros ###
 ament_auto_add_library(glim_ros SHARED
   src/glim_ros/glim_ros.cpp
+  src/glim_ros/glim_ros_callbacks.cpp
   src/glim_ros/ros_qos.cpp
 )
 target_include_directories(glim_ros PUBLIC
@@ -72,6 +73,10 @@ rclcpp_components_register_nodes(glim_ros "glim::GlimROS")
 
 ament_auto_add_library(rviz_viewer SHARED
   src/glim_ros/rviz_viewer.cpp
+)
+# For GlimROSCallbacks: the reset callback slot must be the same object in both libraries
+target_link_libraries(rviz_viewer
+  glim_ros
 )
 
 ### glim_rosnode ###
